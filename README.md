@@ -1,2 +1,2 @@
-# amqppublish
-Reads messages from stdin and publishes to rabbitmq
+# amqpcli
+RabbitMQ command line interface to consume and publish messages
