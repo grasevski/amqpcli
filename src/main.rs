@@ -1,8 +1,12 @@
 //! AMQP command line interface.
 use amq_protocol_types::FieldTable;
+use core::time::Duration;
 use futures_lite::stream::StreamExt;
 use lapin::{
-    options::{BasicConsumeOptions, BasicPublishOptions},
+    options::{
+        BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
+        BasicRejectOptions,
+    },
     BasicProperties, Channel, Connection, ConnectionProperties,
 };
 use mimalloc::MiMalloc;
@@ -12,6 +16,22 @@ use structopt::StructOpt;
 /// A fast cross platform allocator.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+/// Sets up stdio and runs the application.
+#[tokio::main]
+async fn main() {
+    reset_signal_pipe_handler();
+    Opts::from_args().run().await;
+}
+
+/// Handle pipe output.
+fn reset_signal_pipe_handler() {
+    #[cfg(target_family = "unix")]
+    {
+        use nix::sys::signal;
+        unsafe { signal::signal(signal::Signal::SIGPIPE, signal::SigHandler::SigDfl) }.unwrap();
+    }
+}
 
 /// Command line interface to publish and consume rabbitmq messages.
 #[derive(StructOpt)]
@@ -44,8 +64,16 @@ enum Cmd {
         queue: String,
 
         /// Identifies the connection.
-        #[structopt(short, long, default_value  = "")]
+        #[structopt(short, long, default_value = "")]
         consumer_tag: String,
+
+        /// Whether to acknowledge messages containing newlines.
+        #[structopt(short, long)]
+        newline_error_ack: bool,
+
+        /// Whether to acknowledge messages which cannot be parsed as utf-8.
+        #[structopt(short, long)]
+        parse_error_ack: bool,
     },
 
     /// Reads messages line by line from stdin and writes them to rabbitmq.
@@ -63,22 +91,77 @@ enum Cmd {
 impl Cmd {
     /// Loops through the messages line by line.
     async fn run(self, chan: Channel) {
+        const BATCH_SIZE: u16 = 0x100;
         match self {
             Self::Consume {
                 queue,
                 consumer_tag,
+                newline_error_ack,
+                parse_error_ack,
             } => {
-                let opts = BasicConsumeOptions {
-                    no_ack: true,
-                    nowait: true,
-                    ..BasicConsumeOptions::default()
-                };
-                let mut consumer = chan
-                    .basic_consume(&queue, &consumer_tag, opts, FieldTable::default())
+                chan.basic_qos(BATCH_SIZE << 1, BasicQosOptions::default())
                     .await
                     .unwrap();
-                while let Some(delivery) = consumer.next().await {
-                    println!("{}", std::str::from_utf8(&delivery.unwrap().data).unwrap());
+                let mut consumer = chan
+                    .basic_consume(
+                        &queue,
+                        &consumer_tag,
+                        BasicConsumeOptions::default(),
+                        FieldTable::default(),
+                    )
+                    .await
+                    .unwrap();
+                let (mut i, mut acker) = (0, None);
+                loop {
+                    if let Ok(delivery) =
+                        tokio::time::timeout(Duration::new(1, 0), consumer.next()).await
+                    {
+                        let delivery = delivery.unwrap().unwrap();
+                        match std::str::from_utf8(&delivery.data) {
+                            Ok(data) => {
+                                if data.contains('\n') {
+                                    eprintln!("message contains newlines: {}", data);
+                                    if newline_error_ack {
+                                        acker = Some(delivery.acker);
+                                    } else {
+                                        delivery
+                                            .acker
+                                            .reject(BasicRejectOptions::default())
+                                            .await
+                                            .unwrap();
+                                    }
+                                } else {
+                                    acker = Some(delivery.acker);
+                                    println!("{}", data);
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("parse error: {}", err);
+                                if parse_error_ack {
+                                    acker = Some(delivery.acker);
+                                } else {
+                                    delivery
+                                        .acker
+                                        .reject(BasicRejectOptions::default())
+                                        .await
+                                        .unwrap();
+                                }
+                            }
+                        }
+                        i += 1;
+                        if i == BATCH_SIZE {
+                            acker
+                                .take()
+                                .unwrap()
+                                .ack(BasicAckOptions { multiple: true })
+                                .await
+                                .unwrap();
+                            i = 0;
+                        }
+                    } else if let Some(acker) = acker.take() {
+                        acker.ack(BasicAckOptions { multiple: true }).await.unwrap();
+                        i = 0;
+                    }
                 }
             }
             Self::Publish {
@@ -100,21 +183,5 @@ impl Cmd {
                 }
             }
         }
-    }
-}
-
-/// Sets up stdio and runs the application.
-#[tokio::main]
-async fn main() {
-    reset_signal_pipe_handler();
-    Opts::from_args().run().await;
-}
-
-/// Handle pipe output.
-fn reset_signal_pipe_handler() {
-    #[cfg(target_family = "unix")]
-    {
-        use nix::sys::signal;
-        unsafe { signal::signal(signal::Signal::SIGPIPE, signal::SigHandler::SigDfl) }.unwrap();
     }
 }
