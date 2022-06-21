@@ -10,7 +10,7 @@ use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties,
 };
 use mimalloc::MiMalloc;
-use std::io::{stdin, BufRead};
+use std::io::{stdin, stdout, BufRead, Write};
 use structopt::StructOpt;
 
 /// A fast cross platform allocator.
@@ -150,6 +150,7 @@ impl Cmd {
                         }
                         i += 1;
                         if i == BATCH_SIZE {
+                            stdout().flush().unwrap();
                             acker
                                 .take()
                                 .unwrap()
@@ -159,6 +160,7 @@ impl Cmd {
                             i = 0;
                         }
                     } else if let Some(acker) = acker.take() {
+                        stdout().flush().unwrap();
                         acker.ack(BasicAckOptions { multiple: true }).await.unwrap();
                         i = 0;
                     }
